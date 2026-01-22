@@ -1,105 +1,242 @@
-# ==========================================================
-# MEDINTEL AI — Medical Research Copilot (Fresh Start)
+# ============================================================
+# MEDINTEL AI — Enterprise Clinical Research Intelligence Engine
 # Author: Veera Babu
-# ==========================================================
+# Backend: FastAPI + JWT + RBAC + Audit + RAG
+# ============================================================
 
-import streamlit as st
 import os
-import requests
+import shutil
+import uuid
+import json
+from datetime import datetime, timedelta
+from typing import List
+
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+from sqlalchemy import create_engine, Column, String, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
 from pypdf import PdfReader
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
-# ==========================================================
-# APP CONFIG
-# ==========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
-st.set_page_config(page_title="MEDINTEL AI", layout="wide")
-st.title("🧬 MEDINTEL AI — Medical Research Copilot")
-st.caption("Hospital | Pharma | Research Medical Intelligence System")
+SECRET_KEY = "MEDINTEL_SECRET_KEY_CHANGE_IN_PROD"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 UPLOAD_DIR = "uploads"
+DB_DIR = "database"
+VECTOR_INDEX = f"{DB_DIR}/index.faiss"
+META_FILE = f"{DB_DIR}/meta.json"
+AUDIT_DB = "sqlite:///./audit.db"
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
 
-# ==========================================================
-# PDF READER
-# ==========================================================
+# ============================================================
+# FASTAPI
+# ============================================================
 
-def read_pdf(file):
+app = FastAPI(title="MEDINTEL AI Enterprise Backend", version="1.0")
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str):
+    return pwd_context.verify(password, hashed)
+
+def create_access_token(data: dict):
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    data.update({"exp": expire})
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
+# ============================================================
+# USERS (Replace with LDAP later)
+# ============================================================
+
+USERS = {
+    "admin": {
+        "username": "admin",
+        "password": hash_password("admin123"),
+        "role": "ADMIN"
+    },
+    "doctor": {
+        "username": "doctor",
+        "password": hash_password("doctor123"),
+        "role": "REVIEWER"
+    }
+}
+
+# ============================================================
+# DATABASE (AUDIT TRAIL)
+# ============================================================
+
+engine = create_engine(AUDIT_DB, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(String, primary_key=True)
+    user = Column(String)
+    action = Column(String)
+    details = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+def audit(db: Session, user: str, action: str, details: str):
+    log = AuditLog(
+        id=str(uuid.uuid4()),
+        user=user,
+        action=action,
+        details=details
+    )
+    db.add(log)
+    db.commit()
+
+# ============================================================
+# AUTH
+# ============================================================
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+@app.post("/token", response_model=Token)
+def login(username: str, password: str):
+    user = USERS.get(username)
+    if not user or not verify_password(password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": username, "role": user["role"]})
+    return {"access_token": token, "token_type": "bearer"}
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
-        reader = PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            content = page.extract_text()
-            if content:
-                text += content + "\n"
-        return text
-    except Exception as e:
-        return ""
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username not in USERS:
+            raise HTTPException(status_code=401)
+        return USERS[username]
+    except JWTError:
+        raise HTTPException(status_code=401)
 
-# ==========================================================
-# PUBMED SEARCH (SAFE MODE)
-# ==========================================================
+# ============================================================
+# VECTOR ENGINE (LOCAL)
+# ============================================================
 
-def search_pubmed(topic):
-    try:
-        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        params = {
-            "db": "pubmed",
-            "term": topic,
-            "retmax": 10
-        }
-        response = requests.get(url, params=params, timeout=10)
-        return response.text
-    except:
-        return None
+model = SentenceTransformer("all-MiniLM-L6-v2")
+DIM = 384
 
-# ==========================================================
-# UI TABS
-# ==========================================================
+if os.path.exists(VECTOR_INDEX) and os.path.exists(META_FILE):
+    index = faiss.read_index(VECTOR_INDEX)
+    metadata = json.load(open(META_FILE))
+else:
+    index = faiss.IndexFlatL2(DIM)
+    metadata = []
 
-tab1, tab2 = st.tabs(["📄 Upload Medical Research PDF", "🌍 Search PubMed Research"])
+def save_index():
+    faiss.write_index(index, VECTOR_INDEX)
+    json.dump(metadata, open(META_FILE, "w"), indent=2)
 
-# ==========================================================
-# TAB 1 — PDF UPLOAD
-# ==========================================================
+def read_pdf(path):
+    reader = PdfReader(path)
+    text = ""
+    for p in reader.pages:
+        if p.extract_text():
+            text += p.extract_text()
+    return text
 
-with tab1:
-    st.header("📄 Upload Medical Research PDF")
+def chunk_text(text, size=500):
+    words = text.split()
+    return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
 
-    uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+def index_document(text, source):
+    chunks = chunk_text(text)
+    embeddings = model.encode(chunks)
+    index.add(np.array(embeddings).astype("float32"))
 
-    if uploaded_file:
-        text = read_pdf(uploaded_file)
+    for c in chunks:
+        metadata.append({"text": c, "source": source})
 
-        if not text.strip():
-            st.error("❌ Could not extract text. This PDF may be scanned image.")
-        else:
-            st.success("✅ PDF processed successfully")
-            st.text_area("Extracted Medical Research Text", text[:8000], height=400)
+    save_index()
 
-# ==========================================================
-# TAB 2 — PUBMED SEARCH
-# ==========================================================
+def search(query, k=5):
+    q = model.encode([query]).astype("float32")
+    _, ids = index.search(q, k)
+    return [metadata[i] for i in ids[0] if i < len(metadata)]
 
-with tab2:
-    st.header("🌍 Search Medical Research (PubMed)")
+# ============================================================
+# API MODELS
+# ============================================================
 
-    topic = st.text_input("Enter medical topic (e.g. diabetes, cancer, heart disease)")
+class QueryRequest(BaseModel):
+    question: str
 
-    if st.button("Search PubMed"):
-        if not topic.strip():
-            st.warning("Please enter a medical topic")
-        else:
-            data = search_pubmed(topic)
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[str]
 
-            if data:
-                st.success("✅ PubMed data fetched successfully")
-                st.text_area("PubMed Search XML Response", data[:8000], height=400)
-            else:
-                st.error("❌ Failed to fetch PubMed data")
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
-# ==========================================================
-# FOOTER
-# ==========================================================
+@app.post("/upload")
+def upload_docs(
+    files: List[UploadFile] = File(...),
+    user=Depends(get_current_user),
+    db: Session = Depends(SessionLocal)
+):
+    if user["role"] != "ADMIN":
+        raise HTTPException(status_code=403)
 
-st.markdown("---")
-st.caption("MEDINTEL AI © 2026 | Medical Research Intelligence Platform | India")
+    for f in files:
+        path = os.path.join(UPLOAD_DIR, f.filename)
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+
+        text = read_pdf(path)
+        index_document(text, f.filename)
+
+    audit(db, user["username"], "UPLOAD", "Documents indexed")
+    return {"status": "Indexed successfully"}
+
+@app.post("/ask", response_model=QueryResponse)
+def ask(
+    req: QueryRequest,
+    user=Depends(get_current_user),
+    db: Session = Depends(SessionLocal)
+):
+    results = search(req.question)
+
+    if not results:
+        raise HTTPException(status_code=404, detail="No documents indexed")
+
+    answer = "\n".join([r["text"][:300] for r in results])
+    sources = list({r["source"] for r in results})
+
+    audit(db, user["username"], "QUERY", req.question)
+
+    return QueryResponse(answer=answer, sources=sources)
+
+@app.get("/health")
+def health():
+    return {"status": "MEDINTEL AI Enterprise Engine Running"}
