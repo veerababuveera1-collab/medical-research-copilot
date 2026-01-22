@@ -1,5 +1,5 @@
 # ==========================================================
-# MEDINTEL AI — Medical Research Copilot (Stable Edition)
+# MEDINTEL AI — Medical Research Copilot (Fresh Start)
 # Author: Veera Babu
 # ==========================================================
 
@@ -32,23 +32,23 @@ def read_pdf(file):
             if content:
                 text += content + "\n"
         return text
-    except:
+    except Exception as e:
         return ""
 
 # ==========================================================
-# PUBMED FETCH (SAFE)
+# PUBMED SEARCH (SAFE MODE)
 # ==========================================================
 
-def fetch_pubmed(topic):
+def search_pubmed(topic):
     try:
         url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         params = {
             "db": "pubmed",
             "term": topic,
-            "retmax": 5
+            "retmax": 10
         }
-        r = requests.get(url, params=params, timeout=10)
-        return r.text
+        response = requests.get(url, params=params, timeout=10)
+        return response.text
     except:
         return None
 
@@ -56,7 +56,7 @@ def fetch_pubmed(topic):
 # UI TABS
 # ==========================================================
 
-tab1, tab2 = st.tabs(["📄 Upload Research PDF", "🌍 Search PubMed"])
+tab1, tab2 = st.tabs(["📄 Upload Medical Research PDF", "🌍 Search PubMed Research"])
 
 # ==========================================================
 # TAB 1 — PDF UPLOAD
@@ -71,7 +71,7 @@ with tab1:
         text = read_pdf(uploaded_file)
 
         if not text.strip():
-            st.error("❌ Unable to extract text. This PDF may be scanned image.")
+            st.error("❌ Could not extract text. This PDF may be scanned image.")
         else:
             st.success("✅ PDF processed successfully")
             st.text_area("Extracted Medical Research Text", text[:8000], height=400)
@@ -89,11 +89,11 @@ with tab2:
         if not topic.strip():
             st.warning("Please enter a medical topic")
         else:
-            data = fetch_pubmed(topic)
+            data = search_pubmed(topic)
 
             if data:
                 st.success("✅ PubMed data fetched successfully")
-                st.text_area("PubMed Search Response", data[:8000], height=400)
+                st.text_area("PubMed Search XML Response", data[:8000], height=400)
             else:
                 st.error("❌ Failed to fetch PubMed data")
 
